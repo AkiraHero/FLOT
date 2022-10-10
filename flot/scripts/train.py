@@ -9,7 +9,6 @@ from flot.models.scene_flow import FLOT
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
-
 def compute_epe(est_flow, batch):
     """
     Compute EPE during training.
@@ -193,23 +192,28 @@ def my_main(dataset_name, nb_iter, batch_size, max_points, nb_epochs):
         path2data = os.path.join(
             pathroot, "..", "data", "HPLFlowNet", "FlyingThings3D_subset_processed_35m"
         )
-        from flot.datasets.flyingthings3d_hplflownet import FT3D
+        from flot.datasets.flyingthings3d_hplflownet import FT3D as CurrentDataset
 
         lr_lambda = lambda epoch: 1.0 if epoch < 50 else 0.1
     elif dataset_name.lower() == "flownet3d".lower():
         path2data = os.path.join(
             pathroot, "..", "data", "flownet3d", "data_processed_maxcut_35_20k_2k_8192"
         )
-        from flot.datasets.flyingthings3d_flownet3d import FT3D
+        from flot.datasets.flyingthings3d_flownet3d import FT3D as CurrentDataset
 
+        lr_lambda = lambda epoch: 1.0 if epoch < 340 else 0.1
+    elif dataset_name.lower() == "waymo".lower():
+        path2data = "s3://juxiaoliang/dataset/waymo/waymo_sf_processed"
+        from flot.datasets.waymo_dataset import WaymoDataset as CurrentDataset
+        
         lr_lambda = lambda epoch: 1.0 if epoch < 340 else 0.1
     else:
         raise ValueError("Invalid dataset name: " + dataset_name)
 
     # Training dataset
-    ft3d_train = FT3D(root_dir=path2data, nb_points=max_points, mode="train")
+    ds = CurrentDataset(root_dir=path2data, nb_points=max_points, mode="train")
     trainloader = DataLoader(
-        ft3d_train,
+        ds,
         batch_size=batch_size,
         pin_memory=True,
         shuffle=True,
