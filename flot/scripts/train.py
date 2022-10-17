@@ -9,6 +9,23 @@ from flot.models.scene_flow import FLOT
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
+#for distributed
+import torch.distributed as dist
+import torch.optim as optim
+import torch.multiprocessing as mp
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+
+def setup(rank, world_size):
+    # os.environ['MASTER_ADDR'] = 'localhost'
+    # os.environ['MASTER_PORT'] = '12355'
+    # initialize the process group
+    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+
+def cleanup():
+    dist.destroy_process_group()
+
+
 def compute_epe(est_flow, batch):
     """
     Compute EPE during training.
@@ -64,7 +81,7 @@ def compute_loss(est_flow, batch):
     return loss
 
 
-def train(scene_flow, trainloader, delta, optimizer, scheduler, path2log, nb_epochs):
+def train(scene_flow, trainloader, delta, optimizer, scheduler, path2log, nb_epochs, rank=0):
     """
     Train scene flow model.
 
@@ -97,8 +114,9 @@ def train(scene_flow, trainloader, delta, optimizer, scheduler, path2log, nb_epo
     epoch_start = 0
 
     # Train
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    scene_flow = scene_flow.to(device, non_blocking=True)
+    # device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    # scene_flow = scene_flow.to(device, non_blocking=True)
+    
     for epoch in range(epoch_start, nb_epochs):
 
         # Init.
@@ -111,7 +129,7 @@ def train(scene_flow, trainloader, delta, optimizer, scheduler, path2log, nb_epo
         for it, batch in enumerate(tqdm(trainloader)):
 
             # Send data to GPU
-            batch = batch.to(device, non_blocking=True)
+            batch = batch.to(rank, non_blocking=True)
 
             # Gradient step
             optimizer.zero_grad()
@@ -123,9 +141,9 @@ def train(scene_flow, trainloader, delta, optimizer, scheduler, path2log, nb_epo
             # Loss evolution
             running_loss += loss.item()
             running_epe += compute_epe(est_flow, batch).item()
-
+            
             # Logs
-            if it % delta == delta - 1:
+            if rank == 0 and it % delta == delta - 1:
                 # Print / save logs
                 writer.add_scalar("Loss/epe", running_epe / delta, total_it)
                 writer.add_scalar("Loss/loss", running_loss / delta, total_it)
@@ -146,13 +164,22 @@ def train(scene_flow, trainloader, delta, optimizer, scheduler, path2log, nb_epo
         scheduler.step()
 
         # Save model after each epoch
-        state = {
-            "nb_iter": scene_flow.nb_iter,
-            "model": scene_flow.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "scheduler": scheduler.state_dict(),
-        }
-        torch.save(state, os.path.join(path2log, "model.tar"))
+        if isinstance(scene_flow, DDP):
+            state = {
+                "nb_iter": scene_flow.module.nb_iter,
+                "model": scene_flow.module.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+            }
+        else:
+            state = {
+                "nb_iter": scene_flow.nb_iter,
+                "model": scene_flow.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+            }
+        if rank == 0:
+            torch.save(state, os.path.join(path2log, "model_epch{}.tar".format(epoch)))
 
     #
     print("Finished Training")
@@ -160,7 +187,7 @@ def train(scene_flow, trainloader, delta, optimizer, scheduler, path2log, nb_epo
     return None
 
 
-def my_main(dataset_name, nb_iter, batch_size, max_points, nb_epochs):
+def my_main(dataset_name, nb_iter, batch_size, max_points, nb_epochs, distributed=False, world_size=2, rank=0):
     """
     Entry point of the script.
 
@@ -209,21 +236,36 @@ def my_main(dataset_name, nb_iter, batch_size, max_points, nb_epochs):
         lr_lambda = lambda epoch: 1.0 if epoch < 340 else 0.1
     else:
         raise ValueError("Invalid dataset name: " + dataset_name)
+    
+    if distributed:
+        setup(rank, world_size)
+        
+
 
     # Training dataset
     ds = CurrentDataset(root_dir=path2data, nb_points=max_points, mode="train")
+    
+    train_sampler = None
+    if distributed:
+        train_sampler = torch.utils.data.distributed.DistributedSampler(ds)
+    
     trainloader = DataLoader(
         ds,
         batch_size=batch_size,
         pin_memory=True,
-        shuffle=True,
+        shuffle=False if distributed else True,
         num_workers=6,
         collate_fn=Batch,
         drop_last=True,
+        sampler=train_sampler
     )
 
     # Model
     scene_flow = FLOT(nb_iter=nb_iter)
+    
+    if distributed:
+        scene_flow.to(rank)
+        scene_flow = DDP(scene_flow, device_ids=[rank])
 
     # Optimizer
     optimizer = torch.optim.Adam(scene_flow.parameters(), lr=1e-3)
@@ -233,15 +275,23 @@ def my_main(dataset_name, nb_iter, batch_size, max_points, nb_epochs):
 
     # Log directory
     now = datetime.now().strftime("%y_%m_%d-%H_%M_%S_%f")
-    now += "__Iter_" + str(scene_flow.nb_iter)
-    now += "__Pts_" + str(max_points)
+    # now += "__Iter_" + str(scene_flow.nb_iter)
+    # now += "__Pts_" + str(max_points)
     path2log = os.path.join(pathroot, "..", "experiments", "logs_" + dataset_name, now)
 
     # Train
-    print("Training started. Logs in " + path2log)
-    train(scene_flow, trainloader, 500, optimizer, scheduler, path2log, nb_epochs)
-
+    if rank == 0:
+        print("Training started. Logs in " + path2log)
+    train(scene_flow, trainloader, 500, optimizer, scheduler, path2log, nb_epochs, rank)
+    cleanup()
+    print("program exit..")
     return None
+
+
+def my_main_distributed_wrapper(rank, *args):
+    my_main(*args, rank=rank)
+    
+
 
 
 if __name__ == "__main__":
@@ -268,7 +318,18 @@ if __name__ == "__main__":
         default=1,
         help="Number of unrolled iterations of the Sinkhorn " + "algorithm.",
     )
+    parser.add_argument("--distributed", type=bool, default=False)
+    parser.add_argument("--ngpus", type=int, default=4, help="GPU num")
+
     args = parser.parse_args()
 
     # Launch training
-    my_main(args.dataset, args.nb_iter, args.batch_size, args.nb_points, args.nb_epochs)
+    if not args.distributed:
+        my_main(args.dataset, args.nb_iter, args.batch_size, args.nb_points, args.nb_epochs)
+    else:
+        mp.spawn(my_main_distributed_wrapper, 
+                 args=(args.dataset, args.nb_iter, args.batch_size, args.nb_points, args.nb_epochs, True, args.ngpus),
+                 nprocs=args.ngpus,
+                 join=True
+                 )
+        

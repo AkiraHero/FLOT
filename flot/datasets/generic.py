@@ -57,6 +57,11 @@ class Batch:
             self.data[key] = [d.to(*args, **kwargs) for d in self.data[key]]
 
         return self
+    
+    def cuda(self):
+        for key in self.data.keys():
+            self.data[key] = [d.cuda() for d in self.data[key]]
+        return self
 
     def pin_memory(self):
 

@@ -5,9 +5,24 @@ from .generic import SceneFlowDataset
 from petrel_helper import PetrelHelper
 import pickle
 import io
+from functools import partial
+
+def remove_out_of_bounds_points(pc, y, x_min, x_max, y_min, y_max, z_min, z_max):
+    # Max needs to be exclusive because the last grid cell on each axis contains
+    # [((grid_size - 1) * cell_size) + *_min, *_max).
+    #   E.g grid_size=512, cell_size = 170/512 with min=-85 and max=85
+    # For z-axis this is not necessary, but we do it for consistency
+    mask = (pc[:, 0] >= x_min) & (pc[:, 0] < x_max) \
+           & (pc[:, 1] >= y_min) & (pc[:, 1] < y_max) \
+           & (pc[:, 2] >= z_min) & (pc[:, 2] < z_max)
+    pc_valid = pc[mask]
+    y_valid = None
+    if y is not None:
+        y_valid = y[mask]
+    return pc_valid, y_valid
 
 class WaymoDataset(SceneFlowDataset):
-    def __init__(self, root_dir, nb_points=None, mode=None):
+    def __init__(self, root_dir, nb_points=None, mode=None, compensate_ego_motion=False,):
         """
         Construct the KITTI scene flow datatset as in:
         Gu, X., Wang, Y., Wu, C., Lee, Y.J., Wang, P., HPLFlowNet: Hierarchical
@@ -27,15 +42,18 @@ class WaymoDataset(SceneFlowDataset):
         super(WaymoDataset, self).__init__(nb_points)
         
         # It has information regarding the files and transformations
-
+        print("[Dataset]Use waymo dataset, where compensate_ego_motion={}".format(compensate_ego_motion))
+        self.compensate_ego_motion_to_pcl = compensate_ego_motion
         self.data_path = root_dir
         self.ph = None
         self.mode = mode
         if self.mode is None:
             self.mode = "train"
         if self.mode == "train":
+            self.data_path = os.path.join(root_dir, 'train')
             metadata_path = os.path.join(root_dir, 'train', 'metadata')
         elif self.mode == "val":
+            self.data_path = os.path.join(root_dir, 'valid')
             metadata_path = os.path.join(root_dir, 'valid', 'metadata')
 
         
@@ -54,7 +72,15 @@ class WaymoDataset(SceneFlowDataset):
             raise FileNotFoundError("Metadata not found, please create it by running preprocess.py")
         
 
-        
+        # self._pillarization_transform = ApplyPillarization(grid_cell_size=grid_cell_size, x_min=x_min,
+        #                                                    y_min=y_min, z_min=z_min, z_max=z_max,
+        #                                                    n_pillars_x=n_pillars_x)
+
+        # This returns a function that removes points that should not be included in the pillarization.
+        # It also removes the labels if given.
+        self._drop_invalid_point_function = self.drop_points_function(x_min=-85,
+                                                          x_max=85, y_min=-85, y_max=85,
+                                                          z_min=-3, z_max=3)
 
     def __len__(self):
         return len(self.metadata['look_up_table'])
@@ -125,16 +151,16 @@ class WaymoDataset(SceneFlowDataset):
         flows = frame[:, -4:]
         return flows
 
-    def subsample_points(self, current_frame, previous_frame, flows):
-        # current_frame.shape[0] == flows.shape[0]
-        if current_frame.shape[0] > self._n_points:
-            indexes_current_frame = np.linspace(0, current_frame.shape[0]-1, num=self._n_points).astype(int)
-            current_frame = current_frame[indexes_current_frame, :]
-            flows = flows[indexes_current_frame, :]
-        if previous_frame.shape[0] > self._n_points:
-            indexes_previous_frame = np.linspace(0, previous_frame.shape[0]-1, num=self._n_points).astype(int)
-            previous_frame = previous_frame[indexes_previous_frame, :]
-        return current_frame, previous_frame, flows
+    # def subsample_points(self, current_frame, previous_frame, flows):
+    #     # current_frame.shape[0] == flows.shape[0]
+    #     if current_frame.shape[0] > self.nb_points:
+    #         indexes_current_frame = np.linspace(0, current_frame.shape[0]-1, num=self.nb_points).astype(int)
+    #         current_frame = current_frame[indexes_current_frame, :]
+    #         flows = flows[indexes_current_frame, :]
+    #     if previous_frame.shape[0] > self.nb_points:
+    #         indexes_previous_frame = np.linspace(0, previous_frame.shape[0]-1, num=self.nb_points).astype(int)
+    #         previous_frame = previous_frame[indexes_previous_frame, :]
+    #     return current_frame, previous_frame, flows
     
     
     @staticmethod
@@ -155,6 +181,19 @@ class WaymoDataset(SceneFlowDataset):
             points_coord = points_coord.T
         point_cloud = np.hstack((points_coord, features))
         return point_cloud
+    
+    @staticmethod
+    def drop_points_function(x_min, x_max, y_min, y_max, z_min, z_max):
+        inner = partial(remove_out_of_bounds_points,
+                                            x_min=x_min,
+                                            y_min=y_min,
+                                            z_min=z_min,
+                                            z_max=z_max,
+                                            x_max=x_max,
+                                            y_max=y_max
+                                            )
+
+        return inner
 
     def load_sequence(self, idx):
         """
@@ -212,8 +251,8 @@ class WaymoDataset(SceneFlowDataset):
         current_frame_pose, previous_frame_pose = self.get_pose_transform(idx)
         flows = self.get_flows(current_frame)
 
-        if self.nb_points is not None:
-            current_frame, previous_frame, flows = self.subsample_points(current_frame, previous_frame, flows)
+        # if self.nb_points is not None:
+        #     current_frame, previous_frame, flows = self.subsample_points(current_frame, previous_frame, flows)
 
         # G_T_C -> Global_TransformMatrix_Current
         G_T_C = np.reshape(np.array(current_frame_pose), [4, 4])
@@ -222,7 +261,20 @@ class WaymoDataset(SceneFlowDataset):
         G_T_P = np.reshape(np.array(previous_frame_pose), [4, 4])
         C_T_P = np.linalg.inv(G_T_C) @ G_T_P
         # https://github.com/waymo-research/waymo-open-dataset/blob/bbcd77fc503622a292f0928bfa455f190ca5946e/waymo_open_dataset/utils/box_utils.py#L179
-        previous_frame = self.get_coordinates_and_features(previous_frame, transform=C_T_P)
+        
+        # compensate ego
+        if self.compensate_ego_motion_to_pcl:
+            previous_frame = self.get_coordinates_and_features(previous_frame, transform=C_T_P)
+        # do not compensate ego
+        else:
+            C_T_P_inv = np.linalg.inv(C_T_P)
+            previous_frame = self.get_coordinates_and_features(previous_frame, transform=None)
+            # retrieve the initial flow
+            # flow is the velocity, frame rate = 10hz
+            frm_time_interval = 0.10 # unit: s
+            flows[:, :3] = (current_frame[:, :3] - self.get_coordinates_and_features(current_frame[:, :3] - flows[:, :3] * frm_time_interval, transform=C_T_P_inv)) / frm_time_interval
+            # note : if u decide not to compensate the flow as the code above, the flow information saving in the metadata is not valid.
+            # because in this repo, there is no effect to the the training procedure, we 【do not】 update the data saved in the metadata. 
         current_frame = self.get_coordinates_and_features(current_frame, transform=None)
 
         # Drop invalid points according to the method supplied
@@ -231,14 +283,24 @@ class WaymoDataset(SceneFlowDataset):
             previous_frame, _ = self._drop_invalid_point_function(previous_frame, None)
 
         # Perform the pillarization of the point_cloud
-        if self._point_cloud_transform is not None and self._apply_pillarization:
-            current_frame = self._point_cloud_transform(current_frame)
-            previous_frame = self._point_cloud_transform(previous_frame)
-        else:
+        # if self._point_cloud_transform is not None and self._apply_pillarization:
+        #     current_frame = self._point_cloud_transform(current_frame)
+        #     previous_frame = self._point_cloud_transform(previous_frame)
+        # else:
             # output must be a tuple
-            previous_frame = (previous_frame, None)
-            current_frame = (current_frame, None)
+        # previous_frame = (previous_frame, None)
+        # current_frame = (current_frame, None)
         # This returns a tuple of augmented pointcloud and grid indices
-
-        return [previous_frame, current_frame], flows
+        previous_frame = previous_frame[:, :3]
+        current_frame = current_frame[:, :3]
+        # print(previous_frame.shape, current_frame.shape, flows.shape)
+        
+        # initial flow： current = previous + flow
+        # now we swap the current/previous frm for the definition of point num. so that the flow should be inversed
+        flows = -flows[:, :3]
+        # mask = flows.sum(axis=1)
+        # mask[mask > 0] = 1
+        # mask = mask.reshape(-1, 1)
+        mask = np.ones_like(current_frame[:, 0:1])
+        return [current_frame, previous_frame], [mask, flows]
 
