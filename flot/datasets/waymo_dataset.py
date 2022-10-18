@@ -2,7 +2,6 @@ import os
 import numpy as np
 from .generic import SceneFlowDataset
 
-from petrel_helper import PetrelHelper
 import pickle
 import io
 from functools import partial
@@ -58,6 +57,7 @@ class WaymoDataset(SceneFlowDataset):
 
         
         if self.data_path.startswith("s3://"):
+            from petrel_helper import PetrelHelper
             self.ph = PetrelHelper()
             
             
@@ -78,9 +78,9 @@ class WaymoDataset(SceneFlowDataset):
 
         # This returns a function that removes points that should not be included in the pillarization.
         # It also removes the labels if given.
-        self._drop_invalid_point_function = self.drop_points_function(x_min=-85,
-                                                          x_max=85, y_min=-85, y_max=85,
-                                                          z_min=-3, z_max=3)
+        self._drop_invalid_point_function = self.drop_points_function(x_min=-35,
+                                                          x_max=35, y_min=-35, y_max=35,
+                                                          z_min=0.3, z_max=3)
 
     def __len__(self):
         return len(self.metadata['look_up_table'])
