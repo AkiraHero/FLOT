@@ -359,7 +359,7 @@ class WaymoDataset(SceneFlowDataset):
             sequence[1] = sequence[1][ind2]
         else:
             n2 = sequence[1].shape[0]
-            sample_idx2 = np.concatenate((np.arange(n2), np.random.choice(n2, self.nb_points - n1, replace=True)),
+            sample_idx2 = np.concatenate((np.arange(n2), np.random.choice(n2, self.nb_points - n2, replace=True)),
                                          axis=-1)
             sequence[1] = sequence[1][sample_idx2]
 
