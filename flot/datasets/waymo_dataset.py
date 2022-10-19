@@ -251,6 +251,11 @@ class WaymoDataset(SceneFlowDataset):
         current_frame_pose, previous_frame_pose = self.get_pose_transform(idx)
         flows = self.get_flows(current_frame)
 
+        # Drop invalid points according to the method supplied
+        if self._drop_invalid_point_function is not None:
+            current_frame, flows = self._drop_invalid_point_function(current_frame, flows)
+            previous_frame, _ = self._drop_invalid_point_function(previous_frame, None)
+    
         # if self.nb_points is not None:
         #     current_frame, previous_frame, flows = self.subsample_points(current_frame, previous_frame, flows)
 
@@ -277,10 +282,7 @@ class WaymoDataset(SceneFlowDataset):
             # because in this repo, there is no effect to the the training procedure, we 【do not】 update the data saved in the metadata. 
         current_frame = self.get_coordinates_and_features(current_frame, transform=None)
 
-        # Drop invalid points according to the method supplied
-        if self._drop_invalid_point_function is not None:
-            current_frame, flows = self._drop_invalid_point_function(current_frame, flows)
-            previous_frame, _ = self._drop_invalid_point_function(previous_frame, None)
+
 
         # Perform the pillarization of the point_cloud
         # if self._point_cloud_transform is not None and self._apply_pillarization:
@@ -303,4 +305,67 @@ class WaymoDataset(SceneFlowDataset):
         # mask = mask.reshape(-1, 1)
         mask = np.ones_like(current_frame[:, 0:1])
         return [current_frame, previous_frame], [mask, flows]
+    
+    
+    def subsample_points(self, sequence, ground_truth):
+        """
+        Subsample point clouds randomly.
 
+        Parameters
+        ----------
+        sequence : list(np.array, np.array)
+            List [pc1, pc2] of point clouds between which to estimate scene 
+            flow. pc1 has size 1 x N x 3 and pc2 has size 1 x M x 3.
+            
+        ground_truth : list(np.array, np.array)
+            List [mask, flow]. mask has size 1 x N x 1 and pc1 has size 
+            1 x N x 3. flow is the ground truth scene flow between pc1 and pc2.
+            mask is binary with zeros indicating where the flow is not 
+            valid/occluded.
+
+        Returns
+        -------
+        sequence : list(np.array, np.array)
+            List [pc1, pc2] of point clouds between which to estimate scene 
+            flow. pc1 has size 1 x n x 3 and pc2 has size 1 x m x 3. The n 
+            points are chosen randomly among the N available ones. The m points
+            are chosen randomly among the M available ones. 
+            If N, M >= 
+            self.nb_point then n, m = self.nb_points. If N, M < 
+            self.nb_point then n, m = self.nb_points. 
+            
+        ground_truth : list(np.array, np.array)
+            List [mask, flow]. mask has size 1 x n x 1 and pc1 has size 
+            1 x n x 3. flow is the ground truth scene flow between pc1 and pc2.
+            mask is binary with zeros indicating where the flow is not 
+            valid/occluded.
+
+        """
+        if sequence[0].shape[0] >= self.nb_points:
+            # Choose points in first scan
+            ind1 = np.random.permutation(sequence[0].shape[0])[: self.nb_points]
+            sequence[0] = sequence[0][ind1]
+            ground_truth = [g[ind1] for g in ground_truth]
+        else:
+            n1 = sequence[0].shape[0]
+            sample_idx1 = np.concatenate((np.arange(n1), np.random.choice(n1, self.nb_points - n1, replace=True)),
+                                         axis=-1)
+            sequence[0] = sequence[0][sample_idx1]
+            ground_truth = [g[sample_idx1] for g in ground_truth]
+            
+        if sequence[1].shape[0] >= self.nb_points:
+            # Choose point in second scan
+            ind2 = np.random.permutation(sequence[1].shape[0])[: self.nb_points]
+            sequence[1] = sequence[1][ind2]
+        else:
+            n2 = sequence[1].shape[0]
+            sample_idx2 = np.concatenate((np.arange(n2), np.random.choice(n2, self.nb_points - n1, replace=True)),
+                                         axis=-1)
+            sequence[1] = sequence[1][sample_idx2]
+
+        return sequence, ground_truth
+
+if __name__ == '__main__':
+    dataset = WaymoDataset(root_dir="/home/xlju/data/waymo_sf_processed", nb_points=8192)
+    sample = dataset[141773]
+    pass
